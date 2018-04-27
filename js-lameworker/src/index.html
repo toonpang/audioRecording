@@ -1,0 +1,323 @@
+<html>
+
+<head>
+  <title>SLS Audio Recording POC</title>
+</head>
+
+<body>
+
+    <h1>PCM to MP3</h1>
+
+    <div class="wrapper">
+        <div class="sound-clips">
+            <!-- flowplayer will init here -->
+        </div>
+    </div>
+
+    <div class="record-controls">
+        <button id="btnRecord" onclick="onRecord()" disabled>Record</button>
+        <button id="btnStop" onclick="onStop()" disabled>Stop</button>
+    </div>
+
+    <div id="log" style="width:100%; border:solid thin; margin:8px; padding:4px;">
+    </div>
+
+    <link rel="stylesheet" href="app.css">
+    <link rel="stylesheet" href="http://releases.flowplayer.org/audio/flowplayer.audio.css">
+    <link rel="stylesheet" href="http://releases.flowplayer.org/7.2.4/skin/skin.css">
+    <script src="flowplayer.js"></script>
+    <script src="flowplayer.hlsjs.light.min.js"></script>
+    <script src="flowplayer.audio.min.js"></script>
+    <script src="lame.js"></script>
+    <script src="https://code.jquery.com/jquery-3.2.1.slim.min.js" integrity="sha384-KJ3o2DKtIkvYIK3UENzmM7KCkRr/rE9/Qpg6aAZGJwFDMVNA/GpGFF93hXpG5KkN" crossorigin="anonymous"></script>
+
+    <script id='init'>
+
+        $(document).ready(function() {
+            log('Started');
+            requestMikePermission();
+        });
+
+
+    </script>
+
+    <script id='logger'>
+
+        function log(msg) {
+            var element = document.querySelector('#log');
+            element.innerHTML += msg + "<br>\n";
+        }
+
+    </script>
+
+
+    <script id='UITasks'>
+        function renderFlowplayerDiv(src, type) {
+            var soundClips = document.querySelector('.sound-clips');
+
+            var clipParent = document.createElement('div')
+            var clipContainer = document.createElement('div');
+
+            clipParent.id = Date.now();
+
+            clipParent.appendChild(clipContainer);
+            soundClips.appendChild(clipParent);
+
+            flowplayer(clipContainer, {
+                audioOnly: true,
+                clip: {
+                sources: [{
+                    type: type,
+                    src: src
+                    }]
+                }
+            });
+
+            renderDownloadDiv(clipParent.id, src);
+
+        }
+
+        function renderDownloadDiv(parentId, src) {
+            var parent = $('#' + parentId)[0];
+
+            var downloadParentDiv = document.createElement('div');
+            var downloadAnchor = document.createElement('a');
+
+            downloadAnchor.download = 'recorded.mp3';
+            downloadAnchor.href = src;
+            downloadAnchor.innerHTML = 'recorded.mp3';
+
+            downloadParentDiv.appendChild(downloadAnchor);
+            parent.appendChild(downloadParentDiv);
+        }
+    </script>
+
+
+    <script id='buttonControl'>
+
+        function onRecord() {
+            startRecording();
+        }
+
+        function onStop() {
+            stopRecording();
+        }
+
+        function recordButtonControl(enable) {
+            var button = $('#btnRecord');
+
+            buttonControl(button, enable, 'Record');
+        }
+
+        function stopButtonControl(enable) {
+            var button = $('#btnStop');
+
+            buttonControl(button, enable, 'Stop');
+        }
+
+        function buttonControl(btn, enable, name) {
+            if (enable === 1) {
+                btn.removeAttr("disabled");
+                log(name + ' button enabled');
+            } else {
+                btn.attr("disabled", "");
+                log(name + ' button disabled');
+
+            }
+        }
+
+    </script>
+
+
+    <script id='recordingTask'>
+        var gAudio = null;       //Audio context
+        var gAudioSrc = null;    //Audio source
+        var gNode = null;        //The audio processor node
+        var gIsRecording = false;
+        var gCfg = {             //Encoder configuration
+            chnlCt: 1,    //1=mono, 2=stereo
+            bufSz: 4096, //input buffer size (bytes), 16bit signed int.
+            sampleRate: 44100,//Input sample rate (samples per second)
+            bitRate: 128    //Output bit rate (9-128)
+        };
+        var LAME_HANDLE = null;
+        var gBuffers = [];
+        var lame = lameworker();
+
+        function requestMikePermission() {
+            log('Requesting mike permission');
+            var constraints = {audio: true};
+
+            try {
+                window.AudioContext = window.AudioContext || window.webkitAudioContext || AudioContext;
+
+                // Some browsers partially implement mediaDevices. We can't just assign an object
+                // with getUserMedia as it would overwrite existing properties.
+                // Here, we will just add the getUserMedia property if it's missing.
+                if (navigator.mediaDevices.getUserMedia === undefined) {
+                    navigator.mediaDevices.getUserMedia = function(constraints) {
+
+                    // First get ahold of the legacy getUserMedia, if present
+                    var getUserMedia = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+
+                    // Some browsers just don't implement it - return a rejected promise with an error
+                    // to keep a consistent interface
+                    if (!getUserMedia) {
+                      return Promise.reject(new Error('getUserMedia is not implemented in this browser'));
+                    }
+
+                    // Otherwise, wrap the call to the old navigator.getUserMedia with a Promise
+                    return new Promise(function(resolve, reject) {
+                      getUserMedia.call(navigator, constraints, resolve, reject);
+                    });
+                  }
+                }
+
+                if (!(gAudio = new window.AudioContext)) {
+                    log("ERR: Unable to create Audio Context");
+                } else {
+                    navigator.mediaDevices.getUserMedia(constraints).then(onGrantedMikePermission, onDeniedMikePermission).catch(onDeniedMikePermission);
+                }
+
+
+
+            } catch (ex) {
+                log("ERR : Unable to find any audio support");
+                gAudio = null;
+            }
+
+        }
+
+        function onGrantedMikePermission(stream) {
+            log('Granted mike permission');
+
+            if (!(gAudioSrc = gAudio.createMediaStreamSource(stream))) {
+                log("ERR: Unable to create audio source");
+            } else {
+                initialize();
+                recordButtonControl(1);
+            }
+        }
+
+        function onDeniedMikePermission() {
+            log('Denied mike permission');
+        }
+
+        function startRecording() {
+            var creator;
+
+            if (!gAudio) {
+                log('ERR: No audio source');
+            } else if (gIsRecording) {
+                log('ERR: Already recording');
+            } else {
+
+                //Create the audio capture node.
+                if (!gNode) {
+                    if (!(creator = gAudioSrc.context.createScriptProcessor || gAudioSrc.createJavaScriptNode)) {
+                        log("ERR: No processor creator");
+                    } else if (!(gNode = creator.call(gAudioSrc.context, gCfg.bufSz, gCfg.chnlCt, gCfg.chnlCt))) {
+                        log("ERR: Unable to create processor node.");
+                    }
+                }
+
+                if (!gNode) {
+                    log('ERR: onRecord: No processor node.');
+                } else {
+
+                    //Set callbacks, connect the node between the audio source and destination.
+                    gNode.onaudioprocess = onAudioProcess;
+                    gAudioSrc.connect(gNode);
+                    gNode.connect(gAudioSrc.context.destination);
+
+                    gIsRecording = true;
+                    recordButtonControl(0);
+                    stopButtonControl(1);
+                    log("Start recording");
+                }
+            }
+        }
+
+        function stopRecording() {
+
+            if (!gAudio) {
+                log('ERR: No audio');
+            } else if (!gAudioSrc) {
+                log('ERR: No audio source');
+            } else if (!gIsRecording) {
+                log('ERR: Not recording');
+            } else {
+
+                //Disconnect the node
+                gNode.onaudioprocess = null;
+                gAudioSrc.disconnect(gNode);
+                gNode.disconnect();
+                gIsRecording = false;
+
+                getMP3(gBuffers, showAudio)
+
+                recordButtonControl(1);
+                stopButtonControl(0);
+                log("Stopped recording");
+            }
+        }
+
+        //Process a single audio buffer.
+        //Input is an array of floating-point samples.
+        function onAudioProcess(e) {
+            var array = event.inputBuffer.getChannelData(0);
+            lame.encodeBufferMono(LAME_HANDLE, array, function (error, buffer) {
+                gBuffers.push(buffer);
+            });
+        }
+
+        //Present the output mp3 stream on the page
+        //as a download link and content in the audio control.
+        function showAudio(blob) {
+            //Create a URL to the blob.
+            var url = window.URL.createObjectURL(blob);
+            //inializing flowplayer
+            renderFlowplayerDiv(url, 'audio/mpeg');
+
+            console.log("Show Audio in flowplayer");
+
+        }
+
+    </script>
+
+    <script id='lameTask'>
+
+        // Initializes LAME so that we can record.
+        function initialize() {
+            lame.init(function (error, handle) {
+                if (error || handle <= 0) {
+                    console.error('LAME error:', error || handle);
+                    return;
+                }
+                // These are all asynchronous but order is guaranteed.
+                lame.setMode(handle, lameworker.MONO);
+                lame.setNumChannels(handle, 1);
+                lame.setInSampleRate(handle, gAudio.sampleRate); // Note that sample rates may vary
+                lame.setOutSampleRate(handle, 44100);
+                lame.initParams(handle);
+                // Keep track of the handle.
+                LAME_HANDLE = handle;
+            });
+        }
+
+        // This function finalizes LAME output and saves the MP3 data to a file.
+        function getMP3(buffers, callback) {
+            // Get the remaining data out of LAME before closing the session.
+            lame.encodeFlush(LAME_HANDLE, function (error, buffer) {
+                // Merge all buffers into a Blob.
+                buffers.push(buffer);
+                var blob = new Blob(buffers, {type: 'audio/mp3'});
+                callback(blob);
+            });
+            lame.close(LAME_HANDLE);
+            LAME_HANDLE = null;
+        }
+    </script>
+</body>
+
+</html>
